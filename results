@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")  # 无显示环境下使用非交互后端
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+from typing import Optional
 import pandas as pd
 
 
@@ -59,17 +60,58 @@ def export_trades(result: pd.DataFrame, save_path: str = "output/trades.csv") ->
 
 
 def print_metrics(metrics: dict, title: str = "回测绩效指标") -> None:
-    """以表格形式打印核心绩效指标。"""
+    """
+    以表格形式打印核心绩效指标（输入为 compute_metrics 的数值型 dict）。
+    """
+    lines = [
+        f"  累计收益率        : {metrics['cumulative_return']:.2%}",
+        f"  年化收益率        : {metrics['annual_return']:.2%}",
+        f"  最大回撤          : {metrics['max_drawdown']:.2%}",
+        f"  夏普比率          : {metrics['sharpe']:.2f}",
+        f"  交易次数（买入）  : {metrics['n_trades']}",
+    ]
+    if metrics.get("final_total") is not None:
+        lines.append(f"  期末总资产(元)    : {metrics['final_total']:,.2f}")
+
     print("\n" + "=" * 46)
     print(f"  {title}")
     print("=" * 46)
-    for key, value in metrics.items():
-        print(f"  {key:<14}: {value}")
+    for line in lines:
+        print(line)
     print("=" * 46 + "\n")
 
 
+def print_comparison(strategy_m: dict, benchmark_m: dict,
+                     bench_name: str = "沪深300") -> None:
+    """
+    打印策略与基准的横向对比表，并计算超额收益（策略指标 - 基准指标）。
+    超额收益口径：累计超额 = 累计收益率之差；年化超额 = 年化收益率之差。
+    """
+    rows = [
+        ("累计收益率", f"{strategy_m['cumulative_return']:.2%}",
+         f"{benchmark_m['cumulative_return']:.2%}",
+         f"{strategy_m['cumulative_return'] - benchmark_m['cumulative_return']:+.2%}"),
+        ("年化收益率", f"{strategy_m['annual_return']:.2%}",
+         f"{benchmark_m['annual_return']:.2%}",
+         f"{strategy_m['annual_return'] - benchmark_m['annual_return']:+.2%}"),
+        ("最大回撤", f"{strategy_m['max_drawdown']:.2%}",
+         f"{benchmark_m['max_drawdown']:.2%}",
+         f"{strategy_m['max_drawdown'] - benchmark_m['max_drawdown']:+.2%}"),
+        ("夏普比率", f"{strategy_m['sharpe']:.2f}",
+         f"{benchmark_m['sharpe']:.2f}",
+         f"{strategy_m['sharpe'] - benchmark_m['sharpe']:+.2f}"),
+    ]
+    print("=" * 66)
+    print(f"  策略 vs 基准对比（超额收益 = 策略 - {bench_name}）")
+    print("=" * 66)
+    print(f"  {'指标':<10}{'策略':>12}{'基准':>12}{'超额':>12}")
+    for name, s, b, e in rows:
+        print(f"  {name:<10}{s:>12}{b:>12}{e:>12}")
+    print("=" * 66 + "\n")
+
+
 def plot_nav_curve(result: pd.DataFrame,
-                   benchmark: pd.DataFrame | None,
+                   benchmark: Optional[pd.DataFrame],
                    save_path: str = "output/nav_curve.png") -> None:
     """
     绘制并保存归一化净值曲线。
