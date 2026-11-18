@@ -128,7 +128,9 @@ class BacktestEngine:
         返回
         ----
         dict
-            累计收益率、年化收益率、最大回撤、夏普比率等指标。
+            数值型指标：cumulative_return（累计收益率）、annual_return（年化收益率）、
+            max_drawdown（最大回撤）、sharpe（夏普比率）、n_trades（买入次数）、
+            final_total（期末总资产）。格式化展示由 output.results.print_metrics 负责。
         """
         nav = result["nav"].values
 
@@ -149,14 +151,15 @@ class BacktestEngine:
         sharpe = (daily_ret.mean() / daily_ret.std() * np.sqrt(periods_per_year)
                   if daily_ret.std() > 0 else 0.0)
 
-        # 交易次数统计（一对买卖算一次完整交易）
-        n_trades = int((result["trade"] == "BUY").sum())
+        # 交易次数统计（基准净值序列没有 trade 列，容错处理）
+        trade_col = result.get("trade")
+        n_trades = int((trade_col == "BUY").sum()) if trade_col is not None else 0
 
         return {
-            "累计收益率": f"{cumulative_return:.2%}",
-            "年化收益率": f"{annual_return:.2%}",
-            "最大回撤": f"{max_drawdown:.2%}",
-            "夏普比率": f"{sharpe:.2f}",
-            "交易次数（买入）": n_trades,
-            "期末总资产(元)": f"{result['total'].iloc[-1]:,.2f}",
+            "cumulative_return": cumulative_return,
+            "annual_return": annual_return,
+            "max_drawdown": max_drawdown,
+            "sharpe": sharpe,
+            "n_trades": n_trades,
+            "final_total": float(result["total"].iloc[-1]) if "total" in result else None,
         }
