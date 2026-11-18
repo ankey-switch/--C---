@@ -1,0 +1,120 @@
+# -*- coding: utf-8 -*-
+"""
+结果输出模块
+============
+负责：
+  1. 打印核心绩效指标（累计收益率、年化收益率、最大回撤、夏普比率）
+  2. 绘制归一化净值曲线图（策略净值 vs 沪深300 基准净值，均从 1.0 开始）
+  3. 在净值曲线上标注买入（红色三角▲）与卖出（绿色三角▼）点
+  4. 将图片保存到 output 目录
+"""
+
+import matplotlib
+matplotlib.use("Agg")  # 无显示环境下使用非交互后端
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+import pandas as pd
+
+
+def _setup_chinese_font() -> None:
+    """
+    动态探测系统中可用的中文字体并配置给 matplotlib，避免中文显示为方块。
+    按优先级依次尝试常见字体，兼容 Windows / macOS / Linux 环境。
+    """
+    candidates = [
+        "Noto Sans CJK SC", "Noto Sans CJK JP",      # Linux（思源黑体）
+        "Noto Serif CJK SC", "Noto Serif CJK JP",    # Linux（思源宋体）
+        "Source Han Sans CN", "WenQuanYi Micro Hei",  # Linux 备选
+        "Microsoft YaHei", "SimHei",                  # Windows
+        "PingFang SC", "Heiti SC", "Arial Unicode MS",  # macOS
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    chosen = [name for name in candidates if name in available]
+    if chosen:
+        plt.rcParams["font.sans-serif"] = chosen + ["DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False  # 正常显示负号
+
+
+_setup_chinese_font()
+
+
+def export_trades(result: pd.DataFrame, save_path: str = "output/trades.csv") -> None:
+    """
+    将买入/卖出交易记录导出为 CSV 文件，便于事后核查。
+
+    参数
+    ----
+    result : pd.DataFrame
+        回测引擎输出的逐日明细。
+    save_path : str
+        CSV 保存路径。
+    """
+    trades = result[result["trade"].notna()].copy()
+    # 统一成交价列：买入取 buy_price，卖出取 sell_price
+    trades["成交价格"] = trades["buy_price"].fillna(trades["sell_price"])
+    trades = trades[["date", "trade", "成交价格", "shares", "cash", "total", "nav"]]
+    trades.columns = ["日期", "方向", "成交价格", "持股数量", "现金", "总资产", "净值"]
+    trades.to_csv(save_path, index=False, encoding="utf-8-sig")
+    print(f"[输出] 交易明细已保存至: {save_path}（共 {len(trades)} 笔）")
+
+
+def print_metrics(metrics: dict, title: str = "回测绩效指标") -> None:
+    """以表格形式打印核心绩效指标。"""
+    print("\n" + "=" * 46)
+    print(f"  {title}")
+    print("=" * 46)
+    for key, value in metrics.items():
+        print(f"  {key:<14}: {value}")
+    print("=" * 46 + "\n")
+
+
+def plot_nav_curve(result: pd.DataFrame,
+                   benchmark: pd.DataFrame | None,
+                   save_path: str = "output/nav_curve.png") -> None:
+    """
+    绘制并保存归一化净值曲线。
+
+    参数
+    ----
+    result : pd.DataFrame
+        回测引擎输出的逐日明细（需包含 date, nav, trade 列）。
+    benchmark : pd.DataFrame 或 None
+        基准指数数据（date, close 两列），将为 None 时只画策略曲线。
+    save_path : str
+        图片保存路径。
+    """
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    # ---------- 策略净值（归一化到 1.0） ----------
+    strategy_nav = result["nav"] / result["nav"].iloc[0]
+    ax.plot(result["date"], strategy_nav, label="策略净值", color="#d62728", lw=1.8)
+
+    # ---------- 基准净值（归一化到 1.0，按共同交易日对齐） ----------
+    if benchmark is not None and len(benchmark) > 0:
+        merged = pd.merge(result[["date"]], benchmark, on="date", how="left").ffill()
+        bench_nav = merged["close"] / merged["close"].iloc[0]
+        ax.plot(result["date"], bench_nav, label="基准：沪深300", color="#7f7f7f",
+                lw=1.5, ls="--")
+
+    # ---------- 标注买卖点 ----------
+    # 买入点：红色上三角▲；卖出点：绿色下三角▼
+    buys = result[result["trade"] == "BUY"]
+    sells = result[result["trade"] == "SELL"]
+    ax.scatter(buys["date"], strategy_nav.loc[buys.index],
+               marker="^", color="#e3170d", s=110, zorder=5, label="买入点")
+    ax.scatter(sells["date"], strategy_nav.loc[sells.index],
+               marker="v", color="#2ca02c", s=110, zorder=5, label="卖出点")
+
+    # ---------- 图表修饰 ----------
+    ax.axhline(y=1.0, color="#bbbbbb", lw=0.8, ls=":")  # 1.0 参考线
+    ax.set_title("双均线策略回测：归一化净值曲线", fontsize=15)
+    ax.set_xlabel("日期")
+    ax.set_ylabel("归一化净值（期初 = 1.0）")
+    ax.legend(loc="best")
+    ax.grid(alpha=0.3)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"[输出] 净值曲线图已保存至: {save_path}")
