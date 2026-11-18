@@ -1,0 +1,70 @@
+# -*- coding: utf-8 -*-
+"""
+策略模块：双均线策略
+====================
+经典双均线（Moving Average Crossover）策略：
+  - 快线：短期均线（默认 5 日）
+  - 慢线：长期均线（默认 20 日）
+  - 快线上穿慢线（金叉）→ 产生买入信号
+  - 快线下穿慢线（死叉）→ 产生卖出信号
+
+重要说明（避免未来函数）：
+  信号基于【当日收盘价】计算，
+  但实际交易在【下一个交易日（T+1）开盘】执行。
+  因此本模块生成的信号列会向后平移一天，由回测引擎按 T+1 开盘价撮合。
+"""
+
+import pandas as pd
+
+
+def dual_ma_signals(df: pd.DataFrame, fast_window: int = 5,
+                    slow_window: int = 20) -> pd.DataFrame:
+    """
+    在行情数据上计算双均线信号。
+
+    参数
+    ----
+    df : pd.DataFrame
+        包含 date, open, high, low, close, volume 列的行情数据（按日期升序）。
+    fast_window : int
+        快线窗口（默认 5 日）。
+    slow_window : int
+        慢线窗口（默认 20 日）。
+
+    返回
+    ----
+    pd.DataFrame
+        在原数据基础上追加以下列：
+          - ma_fast   : 快线均线值
+          - ma_slow   : 慢线均线值
+          - signal_raw: 当日产生的原始信号（1=买入, -1=卖出, 0=无操作），
+                        基于当日收盘价计算
+          - signal    : 平移一天后的执行信号（T+1 开盘执行），避免未来函数
+    """
+    df = df.copy()
+
+    # 计算快慢两条简单移动平均线（基于当日收盘价）
+    df["ma_fast"] = df["close"].rolling(window=fast_window, min_periods=fast_window).mean()
+    df["ma_slow"] = df["close"].rolling(window=slow_window, min_periods=slow_window).mean()
+
+    # 均线尚未形成完整窗口的日期不产生信号
+    df["signal_raw"] = 0
+
+    # 金叉判定：昨日快线 <= 慢线，且今日快线 > 慢线 → 买入信号（+1）
+    golden_cross = (df["ma_fast"].shift(1) <= df["ma_slow"].shift(1)) & \
+                   (df["ma_fast"] > df["ma_slow"])
+    # 死叉判定：昨日快线 >= 慢线，且今日快线 < 慢线 → 卖出信号（-1）
+    death_cross = (df["ma_fast"].shift(1) >= df["ma_slow"].shift(1)) & \
+                  (df["ma_fast"] < df["ma_slow"])
+
+    df.loc[golden_cross, "signal_raw"] = 1
+    df.loc[death_cross, "signal_raw"] = -1
+
+    # 关键一步：信号向后平移一天。
+    # 当日收盘后产生的信号，实际在 T+1 开盘执行，避免使用未来数据。
+    df["signal"] = df["signal_raw"].shift(1).fillna(0).astype(int)
+
+    # 前面 slow_window-1 天均线不完整，不应产生任何信号
+    df.loc[df["ma_slow"].isna(), ["signal_raw", "signal"]] = 0
+
+    return df
