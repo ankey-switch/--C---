@@ -6,7 +6,8 @@
 
 ```
 quant_backtest/
-├── main.py                 # 主入口：串起数据获取 → 信号 → 回测 → 输出
+├── main/
+│   └── main.py             # 主入口（命令行参数版）：数据 → 信号 → 回测 → 输出
 ├── requirements.txt        # 依赖清单
 ├── README.md               # 本说明文件
 ├── data/
@@ -43,7 +44,7 @@ quant_backtest/
 ### 1. 安装依赖
 
 ```bash
-cd quant_backtest
+cd quant
 pip install -r requirements.txt
 ```
 
@@ -52,7 +53,7 @@ pip install -r requirements.txt
 ### 2. 运行回测
 
 ```bash
-python main.py
+python main/main.py
 ```
 
 ### 3. 查看结果
@@ -124,7 +125,15 @@ python main.py
 
 ## 修改参数
 
-编辑 `main.py` 顶部的参数区即可更换标的、区间、均线窗口、资金、费率等。
+主入口改为命令行参数版，无需改源码，例如：
+
+```bash
+python main/main.py                       # 默认参数
+python main/main.py --symbol 600519 --start_date 20190101 --end_date 20241231
+python main/main.py --fast 10 --slow 30 --capital 500000 --split_date 20230101
+```
+
+完整参数请用 `python main/main.py --help` 查看。
 
 ## 关键实现说明
 
