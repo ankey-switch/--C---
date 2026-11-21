@@ -1,133 +1,258 @@
 # -*- coding: utf-8 -*-
 """
-量化回测项目主入口
-==================
-整体流程：
-  1. 通过 data 模块获取个股（平安银行）与基准（沪深300）日频数据
-  2. 通过 strategy 模块计算双均线买卖信号（T+1 执行，避免未来函数）
-  3. 通过 backtest 模块执行回测（初始资金 / 手续费 / 滑点）
-  4. 通过 output 模块输出：
-     - 全区间绩效指标 + 策略 vs 基准超额收益对比
-     - 样本内 / 样本外分段绩效（验证策略稳健性，避免过拟合质疑）
-     - 归一化净值曲线图（标注买卖点）与交易明细 CSV
+量化回测项目主入口（命令行参数版）
+====================================
+支持通过命令行参数灵活配置回测条件，无需改动源码。
+
+示例用法：
+  # 使用默认参数直接运行
+  python main.py
+
+  # 指定股票和时间区间
+  python main.py --symbol 600519 --start_date 20190101 --end_date 20241231
+
+  # 完整自定义
+  python main.py --symbol 600519 --start_date 20190101 --end_date 20241231 \\
+                 --fast 10 --slow 30 --capital 500000 --split_date 20230101
 """
 
+import argparse
 import os
 import sys
 
 import pandas as pd
 
-# 将项目根目录加入 sys.path，保证各模块可被正确导入
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# main.py 位于 <项目根目录>/main/ 下，项目根目录是其上一级目录。
+# 必须把项目根目录加入 sys.path，否则找不到 data/strategy/backtest/output 包。
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from data.data_fetcher import fetch_data, fetch_benchmark
 from strategy.dual_ma import dual_ma_signals
 from backtest.engine import BacktestEngine
 from output.results import (print_metrics, print_comparison,
-                            plot_nav_curve, export_trades)
+                             plot_nav_curve, export_trades)
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  命令行参数解析
+# ══════════════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    """
+    定义并解析所有命令行参数。
+    每个参数都有安全的默认值，直接 python main.py 即可运行。
+    """
+    parser = argparse.ArgumentParser(
+        description="双均线量化回测系统",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        # 在 --help 页面底部附加使用示例
+        epilog=(
+            "示例：\n"
+            "  python main.py --symbol 600519 --start_date 20190101\n"
+            "  python main.py --fast 10 --slow 30 --capital 500000"
+        ),
+    )
+
+    parser.add_argument("--symbol",      type=str,   default="000001",
+                        help="股票代码（A股6位代码）")
+    parser.add_argument("--start_date",  type=str,   default="20200101",
+                        help="回测开始日期，格式 YYYYMMDD")
+    parser.add_argument("--end_date",    type=str,   default="20241231",
+                        help="回测结束日期，格式 YYYYMMDD")
+    parser.add_argument("--fast",        type=int,   default=5,
+                        help="快线（短期均线）窗口天数")
+    parser.add_argument("--slow",        type=int,   default=20,
+                        help="慢线（长期均线）窗口天数")
+    parser.add_argument("--capital",     type=float, default=1_000_000.0,
+                        help="初始资金（元）")
+    parser.add_argument("--commission",  type=float, default=0.0003,
+                        help="手续费率（例如万三填 0.0003）")
+    parser.add_argument("--slippage",    type=float, default=0.001,
+                        help="滑点率（例如千一填 0.001）")
+    parser.add_argument("--split_date",  type=str,   default="20240101",
+                        help="样本内/外划分日期，格式 YYYYMMDD")
+
+    return parser.parse_args()
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    """
+    对参数做基本合法性校验，提前发现错误，给出明确提示。
+    """
+    if args.fast >= args.slow:
+        raise ValueError(
+            f"快线窗口（--fast={args.fast}）必须小于慢线窗口（--slow={args.slow}）"
+        )
+    if args.capital <= 0:
+        raise ValueError(f"初始资金（--capital={args.capital}）必须大于 0")
+    if args.commission < 0 or args.commission > 0.01:
+        raise ValueError(
+            f"手续费率（--commission={args.commission}）不合理，建议范围 0~0.01"
+        )
+    if not (8 <= len(args.start_date) == len(args.end_date) == 8):
+        raise ValueError("日期格式应为 8 位 YYYYMMDD，如 20200101")
+    if args.start_date >= args.end_date:
+        raise ValueError("start_date 必须早于 end_date")
+    if not (args.start_date <= args.split_date <= args.end_date):
+        raise ValueError("split_date 必须在 start_date 和 end_date 之间")
+
+
+def _print_config(args: argparse.Namespace) -> None:
+    """
+    在程序启动时打印当前完整参数配置，方便复现和排查。
+    """
+    width = 50
+    print("\n" + "═" * width)
+    print("  双均线量化回测系统  参数配置".center(width))
+    print("═" * width)
+    print(f"  {'股票代码':<14}{args.symbol}")
+    print(f"  {'回测区间':<14}{args.start_date}  ~  {args.end_date}")
+    print(f"  {'快线窗口':<14}MA{args.fast}")
+    print(f"  {'慢线窗口':<14}MA{args.slow}")
+    print(f"  {'初始资金':<14}{args.capital:,.0f} 元")
+    print(f"  {'手续费率':<14}{args.commission:.4%}")
+    print(f"  {'滑点率':<14}{args.slippage:.4%}")
+    print(f"  {'样本内/外划分':<14}{args.split_date}")
+    print("═" * width + "\n")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  分段报告（保留原 main.py 的完整业务逻辑）
+# ══════════════════════════════════════════════════════════════════════
 
 def segment_report(name: str, seg_df: pd.DataFrame, seg_bench: pd.DataFrame,
                    engine: BacktestEngine) -> None:
     """
-    对给定数据段执行回测，打印该段指标及与基准的超额收益对比。
+    对给定数据段执行独立回测，打印该段指标及与基准的超额收益对比。
 
     参数
     ----
     name : str
-        数据段名称（"样本内" / "样本外"）。
+        数据段名称，如"样本内"/"样本外"。
     seg_df : pd.DataFrame
-        该段的带信号行情数据（已由全量数据统一计算信号后切分）。
+        该段的带信号行情数据（已由全量数据统一计算信号后按日期切分）。
     seg_bench : pd.DataFrame
-        该段的基准指数数据（date, close）。
+        该段对应的基准指数数据（date, close）。
     engine : BacktestEngine
-        回测引擎实例。
+        回测引擎实例（复用同一实例，仅传参不保留状态）。
     """
     if len(seg_df) < 30:
         print(f"[{name}] 数据不足（{len(seg_df)} 个交易日），跳过分段报告")
         return
 
-    # 策略在该段的独立回测（初始资金重新设定，两段独立核算）
+    # 策略在该段的独立回测
     seg_result = engine.run(seg_df)
     strat_m = BacktestEngine.compute_metrics(seg_result)
 
-    # 基准在同段的表现：把收盘价序列归一化成净值后复用同一指标计算
-    seg_bench = seg_bench[(seg_bench["date"] >= seg_df["date"].iloc[0]) &
-                          (seg_bench["date"] <= seg_df["date"].iloc[-1])].reset_index(drop=True)
-    bench_nav = pd.DataFrame({"nav": seg_bench["close"] / seg_bench["close"].iloc[0]})
+    # 基准同段表现：收盘价序列归一化为净值后，复用同一指标函数计算
+    seg_bench_filtered = seg_bench[
+        (seg_bench["date"] >= seg_df["date"].iloc[0]) &
+        (seg_bench["date"] <= seg_df["date"].iloc[-1])
+    ].reset_index(drop=True)
+
+    if seg_bench_filtered.empty:
+        print(f"[{name}] 基准数据为空，跳过对比")
+        return
+
+    bench_nav = pd.DataFrame({
+        "nav": seg_bench_filtered["close"] / seg_bench_filtered["close"].iloc[0]
+    })
     bench_m = BacktestEngine.compute_metrics(bench_nav)
 
-    print(f"\n{'#' * 50}\n  {name}区间："
+    # 打印分段标题 + 指标 + 对比
+    print(f"\n{'#' * 50}")
+    print(f"  {name}区间："
           f"{seg_df['date'].iloc[0].date()} ~ {seg_df['date'].iloc[-1].date()}"
-          f"（{len(seg_df)} 个交易日）\n{'#' * 50}")
-    print_metrics(strat_m, title=f"{name}·策略指标")
+          f"  （{len(seg_df)} 个交易日）")
+    print(f"{'#' * 50}")
+    print_metrics(strat_m, title=f"{name} · 策略指标")
     print_comparison(strat_m, bench_m)
 
 
-def main():
-    # ==================== 回测参数设置 ====================
-    symbol = "000001"          # 标的股票：平安银行
-    start_date = "20200101"    # 回测开始日期
-    end_date = "20241231"      # 回测结束日期
-    fast_window = 5            # 快线窗口（5 日均线）
-    slow_window = 20           # 慢线窗口（20 日均线）
-    initial_capital = 1_000_000.0   # 初始资金：100 万元
-    commission_rate = 0.0003        # 手续费：万分之三
-    slippage_rate = 0.001           # 滑点：千分之一
-    split_date = "20240101"         # 样本内/样本外划分点（前 4 年调参验证，后 1 年留作样本外）
+# ══════════════════════════════════════════════════════════════════════
+#  主函数
+# ══════════════════════════════════════════════════════════════════════
 
-    # ==================== 1. 数据获取 ====================
-    print(f"[数据] 正在获取 {symbol} 日频数据（{start_date} ~ {end_date}）...")
-    df = fetch_data(symbol, start_date, end_date)
-    print(f"[数据] 获取成功，共 {len(df)} 个交易日，区间："
-          f"{df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()}")
+def main() -> None:
+    # ── 解析并校验参数 ────────────────────────────────────────────────
+    args = parse_args()
+    try:
+        _validate_args(args)
+    except ValueError as e:
+        print(f"\n❌ 参数错误：{e}")
+        sys.exit(1)
 
-    print("[数据] 正在获取基准指数（沪深300）数据...")
-    benchmark = fetch_benchmark("000300", start_date, end_date)
-    print(f"[数据] 基准数据获取成功，共 {len(benchmark)} 个交易日")
+    # ── 打印当前参数配置 ──────────────────────────────────────────────
+    _print_config(args)
 
-    # ==================== 2. 策略信号计算 ====================
-    print(f"[策略] 计算双均线信号（MA{fast_window} 上穿/下穿 MA{slow_window}）...")
-    df = dual_ma_signals(df, fast_window=fast_window, slow_window=slow_window)
-    n_buy = (df["signal_raw"] == 1).sum()
+    # 项目根目录（main.py 位于 <项目根>/main/，故取其上一级）
+    # 用于动态拼接 output/ 路径，不受工作目录影响
+    root_dir = PROJECT_ROOT
+
+    # ── 1. 数据获取 ───────────────────────────────────────────────────
+    print(f"[1/5] 获取个股数据（{args.symbol}）：{args.start_date} ~ {args.end_date}...")
+    df = fetch_data(args.symbol, args.start_date, args.end_date)
+    print(f"      共 {len(df)} 个交易日，"
+          f"区间：{df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()}")
+
+    print("[1/5] 获取基准数据（沪深300）...")
+    benchmark = fetch_benchmark("000300", args.start_date, args.end_date)
+    print(f"      共 {len(benchmark)} 个交易日")
+
+    # ── 2. 策略信号计算 ───────────────────────────────────────────────
+    print(f"\n[2/5] 计算双均线信号（MA{args.fast} / MA{args.slow}）...")
+    df = dual_ma_signals(df, fast_window=args.fast, slow_window=args.slow)
+    n_buy  = (df["signal_raw"] == 1).sum()
     n_sell = (df["signal_raw"] == -1).sum()
-    print(f"[策略] 信号统计：金叉（买入信号）{n_buy} 次，死叉（卖出信号）{n_sell} 次")
+    print(f"      金叉（买入）{n_buy} 次，死叉（卖出）{n_sell} 次")
 
-    # ==================== 3. 全区间回测 ====================
-    print(f"[回测] 初始资金 {initial_capital:,.0f} 元，"
-          f"手续费 {commission_rate:.4%}，滑点 {slippage_rate:.2%}，T+1 开盘执行")
-    engine = BacktestEngine(initial_capital=initial_capital,
-                            commission_rate=commission_rate,
-                            slippage_rate=slippage_rate)
+    # ── 3. 全区间回测 ─────────────────────────────────────────────────
+    print(f"\n[3/5] 执行全区间回测...")
+    print(f"      初始资金 {args.capital:,.0f} 元｜"
+          f"手续费 {args.commission:.4%}｜"
+          f"滑点 {args.slippage:.4%}｜T+1 开盘执行")
+
+    engine = BacktestEngine(
+        initial_capital=args.capital,
+        commission_rate=args.commission,
+        slippage_rate=args.slippage,
+    )
     result = engine.run(df)
 
-    # ==================== 4. 结果输出 ====================
-    # 4.1 全区间指标 + 与基准的超额收益对比
+    # ── 4. 结果输出 ───────────────────────────────────────────────────
+    print("\n[4/5] 计算绩效指标...")
+
+    # 4.1 全区间策略指标
     metrics = BacktestEngine.compute_metrics(result)
     print_metrics(metrics, title="全区间回测绩效指标")
 
-    bench_nav = pd.DataFrame({"nav": benchmark["close"] / benchmark["close"].iloc[0]})
+    # 4.2 全区间基准指标 & 超额对比
+    bench_nav = pd.DataFrame({
+        "nav": benchmark["close"] / benchmark["close"].iloc[0]
+    })
     bench_metrics = BacktestEngine.compute_metrics(bench_nav)
     print_comparison(metrics, bench_metrics)
 
-    # 4.2 样本内 / 样本外分段报告
-    # 信号基于全量数据一次性计算后按日期切分：
-    # 样本外段开头的均线已有样本内尾部的完整预热历史，与实盘可用信息一致，无未来函数。
-    split_ts = pd.Timestamp(split_date)
+    # 4.3 样本内 / 样本外分段报告
+    print("\n[4/5] 分段报告（样本内 / 样本外）...")
+    split_ts = pd.Timestamp(args.split_date)
     train_df = df[df["date"] < split_ts].reset_index(drop=True)
-    test_df = df[df["date"] >= split_ts].reset_index(drop=True)
+    test_df  = df[df["date"] >= split_ts].reset_index(drop=True)
     segment_report("样本内", train_df, benchmark, engine)
-    segment_report("样本外", test_df, benchmark, engine)
+    segment_report("样本外", test_df,  benchmark, engine)
 
-    # 4.3 归一化净值曲线图（标注买卖点）
-    save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "output", "nav_curve.png")
-    plot_nav_curve(result, benchmark, save_path=save_path)
+    # ── 5. 图表与 CSV 输出 ────────────────────────────────────────────
+    print("\n[5/5] 生成图表与交易明细...")
 
-    # 4.4 交易明细 CSV
-    trade_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "output", "trades.csv")
+    # 路径通过 os.path 动态构建，确保无论从哪个目录调用 main.py 都能存对位置
+    nav_path   = os.path.join(root_dir, "output", "nav_curve.png")
+    trade_path = os.path.join(root_dir, "output", "trades.csv")
+
+    plot_nav_curve(result, benchmark, save_path=nav_path)
     export_trades(result, save_path=trade_path)
+
+    print("\n✅ 全流程完成！")
 
 
 if __name__ == "__main__":
