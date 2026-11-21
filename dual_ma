@@ -8,15 +8,102 @@
   - 快线上穿慢线（金叉）→ 产生买入信号
   - 快线下穿慢线（死叉）→ 产生卖出信号
 
-重要说明（避免未来函数）：
+关键设计（避免未来函数）：
   信号基于【当日收盘价】计算，
   但实际交易在【下一个交易日（T+1）开盘】执行。
-  因此本模块生成的信号列会向后平移一天，由回测引擎按 T+1 开盘价撮合。
+  因此本模块生成的 signal 列会向后平移一天，由回测引擎按 T+1 开盘价撮合。
+
+本文件可独立运行（自测）：
+    python strategy/dual_ma.py
+或指定参数：
+    python strategy/dual_ma.py --fast 10 --slow 60
 """
+
+import argparse
+import os
+import sys
 
 import pandas as pd
 
+# 允许以 `python strategy/dual_ma.py` 直接运行时找到项目内其他模块
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
+
+# ----------------------------------------------------------------------
+# 内部工具函数
+# ----------------------------------------------------------------------
+def _validate_input(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    校验并规范化输入行情数据。
+
+    处理内容：
+      1. 检查必需列是否存在，缺失时给出明确的中文报错
+      2. date 列统一转为 datetime
+      3. 价格列强制转数值，剔除无法解析的行
+      4. 按日期升序排序并重置索引（保证 shift / rolling 的时间方向正确）
+
+    参数
+    ----
+    df : pd.DataFrame
+        原始行情数据。
+
+    返回
+    ----
+    pd.DataFrame
+        规范化后的数据副本。
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"输入必须是 pandas.DataFrame，当前类型：{type(df).__name__}")
+    if df.empty:
+        raise ValueError("输入数据为空，无法计算信号")
+
+    required = ["date", "open", "high", "low", "close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"行情数据缺少必需列 {missing}。\n"
+            f"  实际列名：{list(df.columns)}\n"
+            f"  要求列名：date, open, high, low, close（volume 可选）"
+        )
+
+    df = df.copy()
+
+    # 日期列统一为 datetime
+    if not pd.api.types.is_datetime64_any_dtype(df["date"]):
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # 价格列转数值，无法解析的置为 NaN
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 关键：必须先按日期升序，否则 rolling/shift 的时间方向会反，信号全错
+    df = (df.dropna(subset=["date", "open", "high", "low", "close"])
+            .sort_values("date")
+            .reset_index(drop=True))
+
+    if df.empty:
+        raise ValueError("清洗后数据为空（日期或价格列全部无法解析）")
+
+    return df
+
+
+def _validate_windows(fast_window: int, slow_window: int) -> None:
+    """校验均线窗口参数是否合理。"""
+    if not isinstance(fast_window, int) or not isinstance(slow_window, int):
+        raise TypeError("均线窗口必须为整数")
+    if fast_window < 2 or slow_window < 2:
+        raise ValueError(f"均线窗口至少为 2，当前 fast={fast_window}, slow={slow_window}")
+    if fast_window >= slow_window:
+        raise ValueError(
+            f"快线窗口必须小于慢线窗口，当前 fast={fast_window} >= slow={slow_window}"
+        )
+
+
+# ----------------------------------------------------------------------
+# 核心：信号计算
+# ----------------------------------------------------------------------
 def dual_ma_signals(df: pd.DataFrame, fast_window: int = 5,
                     slow_window: int = 20) -> pd.DataFrame:
     """
@@ -25,11 +112,11 @@ def dual_ma_signals(df: pd.DataFrame, fast_window: int = 5,
     参数
     ----
     df : pd.DataFrame
-        包含 date, open, high, low, close, volume 列的行情数据（按日期升序）。
+        包含 date, open, high, low, close 列的行情数据（volume 可选）。
     fast_window : int
         快线窗口（默认 5 日）。
     slow_window : int
-        慢线窗口（默认 20 日）。
+        慢线窗口（默认 20 日），必须大于 fast_window。
 
     返回
     ----
@@ -40,8 +127,11 @@ def dual_ma_signals(df: pd.DataFrame, fast_window: int = 5,
           - signal_raw: 当日产生的原始信号（1=买入, -1=卖出, 0=无操作），
                         基于当日收盘价计算
           - signal    : 平移一天后的执行信号（T+1 开盘执行），避免未来函数
+          - trend     : 均线状态（1=快线在慢线上方，0=下方），便于调试与绘图
     """
-    df = df.copy()
+    # 参数与输入校验（失败时抛中文异常，而不是静默返回错误结果）
+    _validate_windows(fast_window, slow_window)
+    df = _validate_input(df)
 
     # 计算快慢两条简单移动平均线（基于当日收盘价）
     df["ma_fast"] = df["close"].rolling(window=fast_window, min_periods=fast_window).mean()
@@ -67,4 +157,79 @@ def dual_ma_signals(df: pd.DataFrame, fast_window: int = 5,
     # 前面 slow_window-1 天均线不完整，不应产生任何信号
     df.loc[df["ma_slow"].isna(), ["signal_raw", "signal"]] = 0
 
+    # 均线状态：供绘图与调试查看当前处于多头还是空头排列
+    df["trend"] = (df["ma_fast"] > df["ma_slow"]).astype(int)
+
     return df
+
+
+def describe_signals(df: pd.DataFrame) -> str:
+    """
+    生成信号统计的文字说明（供主程序与控制台输出使用）。
+
+    参数
+    ----
+    df : pd.DataFrame
+        已计算信号的行情数据。
+
+    返回
+    ----
+    str
+        形如「金叉 40 次，死叉 39 次」的说明文字。
+    """
+    if "signal_raw" not in df.columns:
+        raise ValueError("数据尚未计算信号，请先调用 dual_ma_signals()")
+    n_buy = int((df["signal_raw"] == 1).sum())
+    n_sell = int((df["signal_raw"] == -1).sum())
+    return f"金叉（买入信号）{n_buy} 次，死叉（卖出信号）{n_sell} 次"
+
+
+# ----------------------------------------------------------------------
+# 独立运行入口（自测）
+# ----------------------------------------------------------------------
+def _main() -> None:
+    """命令行自测：读本地/在线数据 → 计算信号 → 打印统计与信号明细。"""
+    parser = argparse.ArgumentParser(description="双均线策略信号自测")
+    parser.add_argument("--symbol", default="000001", help="股票代码，默认 000001")
+    parser.add_argument("--start", default="20200101", help="开始日期 YYYYMMDD")
+    parser.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+    parser.add_argument("--fast", type=int, default=5, help="快线窗口，默认 5")
+    parser.add_argument("--slow", type=int, default=20, help="慢线窗口，默认 20")
+    parser.add_argument("--csv", default=None, help="本地 CSV 路径（可选，优先使用）")
+    args = parser.parse_args()
+
+    from data.data_fetcher import fetch_data  # 延迟导入，避免循环依赖
+
+    print(f"[1/3] 获取 {args.symbol} 行情数据 ...")
+    df = fetch_data(args.symbol, args.start, args.end, local_csv=args.csv)
+    print(f"      共 {len(df)} 个交易日：{df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()}")
+
+    print(f"[2/3] 计算双均线信号 MA{args.fast} / MA{args.slow} ...")
+    df = dual_ma_signals(df, fast_window=args.fast, slow_window=args.slow)
+    print(f"      {describe_signals(df)}")
+
+    # 打印最近 5 次信号的产生日与执行日，直观展示 T+1 逻辑
+    # 注意：执行日必须在【全量数据】上取下一行日期，若在信号子集上 shift 会跳过中间交易日
+    df = df.copy()
+    df["执行日"] = df["date"].shift(-1)
+    sig = df[df["signal_raw"] != 0]
+    if not sig.empty:
+        print("\n[3/3] 最近 5 次信号（信号基于当日收盘计算 → 次日开盘执行）：")
+        show = sig.tail(5)[["date", "close", "ma_fast", "ma_slow", "signal_raw", "执行日"]]
+        show = show.rename(columns={
+            "date": "信号日", "close": "收盘价",
+            "ma_fast": f"MA{args.fast}", "ma_slow": f"MA{args.slow}",
+            "signal_raw": "信号",
+        })
+        show["信号"] = show["信号"].map({1: "买入", -1: "卖出"})
+        show[f"MA{args.fast}"] = show[f"MA{args.fast}"].round(2)
+        show[f"MA{args.slow}"] = show[f"MA{args.slow}"].round(2)
+        print(show.to_string(index=False))
+    else:
+        print("\n[3/3] 该区间内未产生任何信号（可能是均线窗口过长或数据不足）")
+
+    print("\n信号计算完成，可将该 DataFrame 传入 BacktestEngine.run() 执行回测。")
+
+
+if __name__ == "__main__":
+    _main()
