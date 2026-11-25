@@ -146,6 +146,8 @@ def _extract_trades(result) -> pd.DataFrame:
         if trades.empty:
             return empty
 
+        has_shares = "dealt_shares" in trades.columns
+        cols = ["date", "action", "price"] + (["shares"] if has_shares else [])
         rows = []
         for _, row in trades.iterrows():
             action = str(row["trade"]).strip().upper()
@@ -154,13 +156,19 @@ def _extract_trades(result) -> pd.DataFrame:
                 price = row.get("buy_price") if "buy_price" in trades.columns else None
                 if price is None or pd.isna(price):
                     price = row.get("open", np.nan)
-                rows.append({"date": row["date"], "action": "buy", "price": price})
+                item = {"date": row["date"], "action": "buy", "price": price}
+                if has_shares:
+                    item["shares"] = row["dealt_shares"]
+                rows.append(item)
             elif action == "SELL":
                 price = row.get("sell_price") if "sell_price" in trades.columns else None
                 if price is None or pd.isna(price):
                     price = row.get("open", np.nan)
-                rows.append({"date": row["date"], "action": "sell", "price": price})
-        return pd.DataFrame(rows, columns=["date", "action", "price"])
+                item = {"date": row["date"], "action": "sell", "price": price}
+                if has_shares:
+                    item["shares"] = row["dealt_shares"]
+                rows.append(item)
+        return pd.DataFrame(rows, columns=cols)
 
     # ── 情形二：result 中有独立的 trades 字段 ─────────────────────
     trades_field = _get_field(result, "trades", "trade_records", "orders")
