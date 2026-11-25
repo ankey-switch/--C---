@@ -2,11 +2,14 @@
 """
 回测引擎模块
 ============
-基于事件驱动的向量化日频回测引擎：
+基于事件驱动的日频回测引擎：
   - 支持设置初始资金
-  - 计入手续费（佣金，默认万分之三）与滑点（默认千分之一）
+  - 交易成本：佣金（默认万分之三、单笔最低 5 元）、印花税（仅卖出，
+    按现行税率万分之五）、滑点（默认千分之一）
   - 信号在 T+1 开盘价执行（与策略模块配合，避免未来函数）
+  - 按整手（100 股）成交，资金不足一手时放弃开仓
   - 正确计算每日持仓（现金 + 市值）与净值，处理空仓时期
+  - get_trades() 可取回逐笔成交明细（股数、金额、费用、成交后现金）
 """
 
 import numpy as np
@@ -16,23 +19,41 @@ import pandas as pd
 class BacktestEngine:
     """双均线策略回测引擎（单标的、全仓进出、日频）。"""
 
+    #: 回测输入数据的必需列（缺列时给出明确报错，而不是 AttributeError）
+    REQUIRED_COLUMNS = ("date", "open", "close", "signal")
+
     def __init__(self,
                  initial_capital: float = 1_000_000.0,
                  commission_rate: float = 0.0003,
-                 slippage_rate: float = 0.001):
+                 slippage_rate: float = 0.001,
+                 stamp_rate: float = 0.0005,
+                 min_commission: float = 5.0,
+                 lot_size: int = 100):
         """
         参数
         ----
         initial_capital : float
             初始资金（元），默认 100 万。
         commission_rate : float
-            手续费率（双边收取），默认万分之三。
+            佣金率（买卖双边收取），默认万分之三。
         slippage_rate : float
             滑点率（买入价上浮 / 卖出价下调），默认千分之一。
+        stamp_rate : float
+            印花税率（仅卖出收取），默认万分之五（2023-08-28 起减半征收后的
+            现行税率；此前为千分之一，本引擎统一按现行税率近似）。
+        min_commission : float
+            单笔最低佣金（元），A股券商普遍为 5 元，成交金额很小时按此收取。
+        lot_size : int
+            一手的股数，A 股为 100 股；买入股数按一手整数倍向下取整。
         """
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
         self.slippage_rate = slippage_rate
+        self.stamp_rate = stamp_rate
+        self.min_commission = min_commission
+        self.lot_size = lot_size
+        # 逐笔成交记录（run() 内填充，get_trades() 读取）
+        self._trades: list = []
 
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -50,45 +71,79 @@ class BacktestEngine:
             逐日回测明细，包含：
               - cash      : 当日收盘后的现金
               - shares    : 当日收盘后的持股数量
+              - dealt_shares : 当日成交股数（未成交为 0）
               - position  : 当日收盘后的持仓市值
               - total     : 当日收盘后的总资产（现金 + 持仓市值）
               - nav       : 净值（总资产 / 初始资金）
               - trade     : 当日成交描述（用于绘图标注买卖点）
         """
+        df = self._validate_input(df)
+
         cash = self.initial_capital  # 当前现金
         shares = 0                   # 当前持股数量（本策略为整数股）
         records = []                 # 逐日结果记录
+        self._trades = []            # 清空上一轮回测的逐笔成交记录
 
         # 逐日遍历行情数据（信号已在策略模块平移一天，指向 T+1 执行）
         for row in df.itertuples(index=False):
-            signal = row.signal
+            signal = int(row.signal)
             trade_desc = None
             buy_price = sell_price = None
+            dealt_shares = 0         # 当日成交股数（用于导出交易明细）
 
-            # ---------- T+1 开盘执行交易 ----------
-            if signal == 1 and shares == 0:
-                # 买入：以开盘价加上滑点成交
-                exec_price = row.open * (1 + self.slippage_rate)
-                if exec_price > 0:
-                    # 用全部可用资金买入（按整手 100 股向下取整）
-                    affordable = cash / ((1 + self.commission_rate) * exec_price)
-                    shares = int(affordable // 100) * 100
-                    if shares > 0:
-                        buy_price = exec_price
-                        cost = shares * exec_price
-                        commission = cost * self.commission_rate  # 买入手续费
+            # ---------- T+1 开盘执行交易（当日开盘价缺失视为停牌，跳过） ----------
+            if not pd.isna(row.open):
+                if signal == 1 and shares == 0:
+                    # 买入：以开盘价加上滑点成交
+                    exec_price = row.open * (1 + self.slippage_rate)
+                    lot = self.lot_size
+                    # 先按佣金率估算可买资金，再逐手下调，
+                    # 保证「股款 + 佣金（不低于最低佣金）」不超过可用现金
+                    n_lots = int(cash // (exec_price * lot * (1 + self.commission_rate)))
+                    while n_lots > 0:
+                        trial_shares = n_lots * lot
+                        trial_cost = trial_shares * exec_price
+                        trial_fee = max(trial_cost * self.commission_rate,
+                                        self.min_commission)
+                        if trial_cost + trial_fee <= cash:
+                            break
+                        n_lots -= 1
+
+                    if n_lots > 0:
+                        shares_buy = n_lots * lot
+                        cost = shares_buy * exec_price
+                        commission = max(cost * self.commission_rate,
+                                         self.min_commission)  # 买入佣金
                         cash -= (cost + commission)
+                        shares = shares_buy
+                        dealt_shares = shares_buy
+                        buy_price = exec_price
                         trade_desc = "BUY"
+                        self._trades.append({
+                            "date": row.date, "action": "BUY",
+                            "price": exec_price, "shares": shares_buy,
+                            "amount": cost, "commission": commission,
+                            "stamp_tax": 0.0, "cash_after": cash,
+                        })
 
-            elif signal == -1 and shares > 0:
-                # 卖出：以开盘价减去滑点成交
-                exec_price = row.open * (1 - self.slippage_rate)
-                sell_price = exec_price
-                proceeds = shares * exec_price
-                commission = proceeds * self.commission_rate  # 卖出手续费
-                cash += (proceeds - commission)
-                shares = 0
-                trade_desc = "SELL"
+                elif signal == -1 and shares > 0:
+                    # 卖出：以开盘价减去滑点成交
+                    exec_price = row.open * (1 - self.slippage_rate)
+                    sell_price = exec_price
+                    proceeds = shares * exec_price
+                    commission = max(proceeds * self.commission_rate,
+                                     self.min_commission)      # 卖出佣金
+                    stamp = proceeds * self.stamp_rate         # 卖出印花税
+                    cash += (proceeds - commission - stamp)
+                    dealt_shares = shares
+                    self._trades.append({
+                        "date": row.date, "action": "SELL",
+                        "price": exec_price, "shares": shares,
+                        "amount": proceeds, "commission": commission,
+                        "stamp_tax": stamp, "cash_after": cash,
+                    })
+                    shares = 0
+                    trade_desc = "SELL"
 
             # ---------- 当日收盘后统计持仓与净值 ----------
             position = shares * row.close                     # 持仓市值（按收盘价估值）
@@ -100,6 +155,7 @@ class BacktestEngine:
                 "signal": signal,
                 "cash": cash,
                 "shares": shares,
+                "dealt_shares": dealt_shares,
                 "position": position,
                 "total": total,
                 "nav": total / self.initial_capital,
@@ -109,6 +165,61 @@ class BacktestEngine:
             })
 
         return pd.DataFrame(records)
+
+    def get_trades(self) -> pd.DataFrame:
+        """
+        返回最近一次 run() 的逐笔成交明细。
+
+        列：date（成交日）、action（BUY/SELL）、price（滑点后成交价）、
+            shares（成交股数）、amount（成交金额）、commission（佣金）、
+            stamp_tax（印花税，仅卖出）、cash_after（成交后现金）。
+        未运行过回测时返回空表。
+        """
+        return pd.DataFrame(self._trades,
+                            columns=["date", "action", "price", "shares",
+                                     "amount", "commission", "stamp_tax",
+                                     "cash_after"])
+
+    # ------------------------------------------------------------------
+    # 输入校验
+    # ------------------------------------------------------------------
+    @classmethod
+    def _validate_input(cls, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        校验回测输入数据，尽早给出可定位的中文报错。
+
+        检查项：
+          1. 必须是 DataFrame 且非空
+          2. 必需列齐全（date / open / close / signal）
+          3. 日期必须升序（否则 shift/rolling 的时间方向反了，结果全错）
+          4. 收盘价必须为正
+
+        返回原 DataFrame（不做拷贝，引擎只读不写）。
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError(
+                f"回测输入必须是 pandas.DataFrame，当前类型：{type(df).__name__}"
+            )
+        if df.empty:
+            raise ValueError(
+                "回测输入数据为空。请检查数据获取模块是否正常返回行情"
+                "（日期区间、股票代码、网络/缓存）。"
+            )
+        missing = [c for c in cls.REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"回测输入数据缺少必需列 {missing}。"
+                f"实际列名：{list(df.columns)}；"
+                f"要求列名：{list(cls.REQUIRED_COLUMNS)}"
+            )
+        if not df["date"].is_monotonic_increasing:
+            raise ValueError(
+                "回测输入数据的 date 列不是升序排列，请先 sort_values('date')，"
+                "否则 T+1 执行顺序会错乱"
+            )
+        if (pd.to_numeric(df["close"], errors="coerce") <= 0).any():
+            raise ValueError("回测输入数据存在非正收盘价，疑似脏数据，请检查数据源")
+        return df
 
     # ------------------------------------------------------------------
     # 绩效指标计算
@@ -132,6 +243,18 @@ class BacktestEngine:
             max_drawdown（最大回撤）、sharpe（夏普比率）、n_trades（买入次数）、
             final_total（期末总资产）。格式化展示由 output.results.print_metrics 负责。
         """
+        # 空结果保护：避免 nav[-1] 直接 IndexError 崩溃，
+        # 返回全 None 的指标字典，由输出模块统一显示为 N/A
+        if result is None or len(result) == 0:
+            return {
+                "cumulative_return": None,
+                "annual_return": None,
+                "max_drawdown": None,
+                "sharpe": None,
+                "n_trades": 0,
+                "final_total": None,
+            }
+
         nav = result["nav"].values
 
         # 1) 累计收益率：期末净值 - 1
